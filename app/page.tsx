@@ -61,9 +61,10 @@ export default function Home() {
       }
 
       if (!response.ok) {
-        throw new Error(data.error || "Something went wrong.");
-      }
-
+  setError(data.error || "Something went wrong.");
+  setLoading(false);
+  return;
+}
       setStudyData(data);
       setStarted(true);
     } catch (error) {
