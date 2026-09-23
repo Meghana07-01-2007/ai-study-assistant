@@ -94,6 +94,21 @@ function cleanImages(value: unknown) {
     );
 }
 
+function cleanImageQueries(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+
+  const queries = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim().replace(/\s+/g, " "))
+    .filter(Boolean)
+    .filter((item) => {
+      const words = item.split(" ");
+      return words.length >= 2 && words.length <= 5;
+    });
+
+  return [...new Set(queries)];
+}
+
 function cleanQuiz(value: unknown) {
   if (!Array.isArray(value)) return [];
 
@@ -231,74 +246,117 @@ async function searchWikimediaImage(
   searchTerm: string
 ) {
   try {
-    const combinedSearch = `"${topic}" ${searchTerm}`;
+    const cleanSearchTerm = searchTerm.trim().replace(/\s+/g, " ");
+    const searchCandidates = [
+      `"${topic}" "${cleanSearchTerm}"`,
+      `${cleanSearchTerm} ${topic}`,
+      cleanSearchTerm,
+      topic,
+    ];
 
-    const apiUrl =
-      "https://commons.wikimedia.org/w/api.php?" +
-      new URLSearchParams({
-        action: "query",
-        generator: "search",
-        gsrsearch: combinedSearch,
-        gsrnamespace: "6",
-        gsrlimit: "10",
-        prop: "imageinfo",
-        iiprop: "url|mime",
-        iiurlwidth: "900",
-        format: "json",
-        origin: "*",
-      }).toString();
+    const seenTitles = new Set<string>();
 
-    const response = await fetch(apiUrl, {
-      cache: "no-store",
-    });
+    for (const combinedSearch of searchCandidates) {
+      const apiUrl =
+        "https://commons.wikimedia.org/w/api.php?" +
+        new URLSearchParams({
+          action: "query",
+          generator: "search",
+          gsrsearch: combinedSearch,
+          gsrnamespace: "6",
+          gsrlimit: "20",
+          prop: "imageinfo",
+          iiprop: "url|mime",
+          iiurlwidth: "1000",
+          format: "json",
+          origin: "*",
+        }).toString();
 
-    if (!response.ok) return null;
+      const response = await fetch(apiUrl, {
+        cache: "no-store",
+      });
 
-    const data = await response.json();
-    const pages = data?.query?.pages;
+      if (!response.ok) continue;
 
-    if (!pages) return null;
+      const data = await response.json();
+      const pages = data?.query?.pages;
+      if (!pages) continue;
 
-    const pageList = Object.values(pages) as {
-      title?: string;
-      imageinfo?: {
-        thumburl?: string;
-        url?: string;
-        mime?: string;
+      const pageList = Object.values(pages) as {
+        title?: string;
+        imageinfo?: {
+          thumburl?: string;
+          url?: string;
+          mime?: string;
+        }[];
       }[];
-    }[];
 
-    for (const page of pageList) {
-      const pageTitle = page.title || "";
-      const imageInfo = page.imageinfo?.[0];
+      const topicWords = getTopicWords(topic);
+      const searchWords = getTopicWords(cleanSearchTerm);
 
-      if (!imageInfo) continue;
+      const candidates = pageList
+        .map((page) => {
+          const pageTitle = page.title || "";
+          const imageInfo = page.imageinfo?.[0];
 
-      if (
-        imageInfo.mime &&
-        ![
-          "image/jpeg",
-          "image/png",
-          "image/webp",
-          "image/svg+xml",
-        ].includes(imageInfo.mime)
-      ) {
-        continue;
+          if (!imageInfo || seenTitles.has(pageTitle)) return null;
+
+          if (
+            imageInfo.mime &&
+            ![
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/svg+xml",
+            ].includes(imageInfo.mime)
+          ) {
+            return null;
+          }
+
+          const title = pageTitle.toLowerCase();
+          const topicMatches = topicWords.filter((word) =>
+            title.includes(word)
+          ).length;
+          const searchMatches = searchWords.filter((word) =>
+            title.includes(word)
+          ).length;
+
+          // Strong preference for exact concept matches, but do not reject
+          // a useful Wikimedia image just because its title uses different wording.
+          const score =
+            searchMatches * 5 +
+            topicMatches * 3 +
+            (title.includes(cleanSearchTerm.toLowerCase()) ? 8 : 0);
+
+          const imageUrl = imageInfo.thumburl || imageInfo.url;
+          if (!imageUrl) return null;
+
+          return {
+            imageUrl,
+            pageTitle,
+            sourceUrl: imageInfo.url || imageUrl,
+            score,
+          };
+        })
+        .filter(Boolean) as {
+        imageUrl: string;
+        pageTitle: string;
+        sourceUrl: string;
+        score: number;
+      }[];
+
+      candidates.sort((a, b) => b.score - a.score);
+
+      if (candidates.length > 0) {
+        const best = candidates[0];
+        seenTitles.add(best.pageTitle);
+
+        return {
+          imageUrl: best.imageUrl,
+          pageTitle: best.pageTitle,
+          sourceUrl: best.sourceUrl,
+        };
       }
-
-      if (!isRelevantImage(pageTitle, topic, searchTerm)) {
-        continue;
-      }
-
-      const imageUrl = imageInfo.thumburl || imageInfo.url;
-
-      if (!imageUrl) continue;
-
-      return {
-        imageUrl,
-        pageTitle,
-        sourceUrl: imageInfo.url || imageUrl,
-      };
     }
 
     return null;
@@ -316,27 +374,31 @@ function getImageInstruction(difficulty: string): string {
   if (difficulty === "Beginner") {
     return `
 - Return an empty images array.
+- Return an empty imageQueries array.
 - Do not include images for Beginner lessons.
 `;
   }
 
   if (difficulty === "Intermediate") {
     return `
-- Return up to 2 image items only when genuinely useful.
-- If the topic has only one suitable diagram or image, return only one image item.
-- If no suitable image exists, return an empty images array.
-- Never add images just to reach a number.
-- Every image must directly explain the topic.
+- Return exactly 3 image items.
+- Return exactly 3 imageQueries.
+- Each image searchTerm/query must be 2-5 words, concrete, specific, and directly tied to a concept explained in the lesson.
+- Prefer labeled diagrams, structures, charts, mechanisms, timelines, or process flows.
+- Do not use generic terms such as "science", "technology", "education", "diagram", or "learning".
+- Never repeat an image searchTerm/query.
+- Every image must directly explain a different important concept from the lesson.
 `;
   }
 
   return `
-- Return up to 3 image items only when genuinely useful.
-- If the topic has only one suitable diagram or image, return only one image item.
-- If the topic has no suitable diagram or image, return an empty images array.
-- Never add images just to reach a number.
-- Every image must directly explain the topic.
-- Do not suggest generic, decorative, unrelated, or loosely connected images.
+- Return exactly 4 image items.
+- Return exactly 4 imageQueries.
+- Each image searchTerm/query must be 2-5 words, concrete, specific, and directly tied to a concept explained in the lesson.
+- Prefer detailed labeled diagrams, structures, charts, mechanisms, timelines, or process flows.
+- Do not use generic terms such as "science", "technology", "education", "diagram", or "learning".
+- Never repeat an image searchTerm/query.
+- Every image must directly explain a different important concept from the lesson.
 `;
 }
 
@@ -451,6 +513,7 @@ Use this exact structure:
       "explanation": "why this exact image is useful for this topic"
     }
   ],
+  "imageQueries": ["2-5 word specific query"],
   "quiz": [
     {
       "question": "string",
@@ -488,7 +551,9 @@ Additional rules:
 - Use accurate educational information.
 - Do not create conceptual diagrams yourself.
 - Use real, specific, educational Wikimedia Commons search terms.
-- Image search terms must be directly related to the topic: "${topic}".
+- Image search terms and imageQueries must be directly related to the topic: "${topic}".
+- Each image search term/query must contain 2-5 meaningful words.
+- Prefer the exact concept name plus a concrete visual noun, such as "mitochondria structure labeled" or "TCP three way handshake".
 - Do not use generic image terms such as "education", "technology", "science", "diagram", or "learning" alone.
 - Do not include inappropriate content.
 - Use double quotes for all JSON keys and string values.
@@ -527,20 +592,56 @@ Additional rules:
       throw new Error("Nova returned invalid JSON. Please try again.");
     }
 
-    const imageRequests = cleanImages(generatedData.images);
+    const generatedImageRequests = cleanImages(generatedData.images);
+    const generatedImageQueries = cleanImageQueries(generatedData.imageQueries);
+
+    const generatedKeyPoints = cleanStringArray(generatedData.keyPoints);
+
+    const fallbackQueries =
+      safeDifficulty === "Intermediate"
+        ? generatedKeyPoints.slice(0, 3)
+        : generatedKeyPoints.slice(0, 4);
+
+    const queryList = [
+      ...generatedImageQueries,
+      ...generatedImageRequests.map((image) => image.searchTerm),
+      ...fallbackQueries,
+    ]
+      .map((query) => query.trim().replace(/\s+/g, " "))
+      .filter(Boolean)
+      .filter((query) => {
+        const words = query.split(" ");
+        return words.length >= 2 && words.length <= 5;
+      })
+      .filter((query, index, array) => array.indexOf(query) === index);
+
+    const requiredImageCount =
+      safeDifficulty === "Intermediate"
+        ? 3
+        : safeDifficulty === "Advanced"
+          ? 4
+          : 0;
+
+    const imageQueries = queryList.slice(0, requiredImageCount);
 
     const images = await Promise.all(
-      imageRequests.map(async (image) => {
-        const result = await searchWikimediaImage(
-          topic,
-          image.searchTerm
-        );
+      imageQueries.map(async (searchTerm) => {
+        const result = await searchWikimediaImage(topic, searchTerm);
 
         if (!result) return null;
 
+        const matchingGeneratedImage = generatedImageRequests.find(
+          (image) =>
+            image.searchTerm.toLowerCase() === searchTerm.toLowerCase()
+        );
+
         return {
-          title: image.title,
-          explanation: image.explanation,
+          title:
+            matchingGeneratedImage?.title ||
+            searchTerm.replace(/\b\w/g, (letter) => letter.toUpperCase()),
+          explanation:
+            matchingGeneratedImage?.explanation ||
+            `This image visually explains the concept "${searchTerm}" in the ${safeDifficulty.toLowerCase()} lesson.`,
           imageUrl: result.imageUrl,
           sourceUrl: result.sourceUrl,
           sourceTitle: result.pageTitle,
@@ -563,6 +664,7 @@ Additional rules:
       deepDive: cleanText(generatedData.deepDive),
       workflow: cleanWorkflow(generatedData.workflow),
       images: images.filter(Boolean),
+      imageQueries,
       quiz: finalQuiz,
     });
   } catch (error) {
